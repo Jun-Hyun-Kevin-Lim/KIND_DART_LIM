@@ -1,0 +1,32 @@
+name: KIND + DART rights issue -> Google Sheets
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 0 * * *"  # 매일 09:10 KST (UTC 00:10)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          HEADLESS: "true"
+          LIMIT: "30"
+          SKIP_SEEN: "false"      # ✅ seen으로 스킵할지 (false면 계속 업데이트)
+          DART_LOOKBACK_DAYS: "14"
+        run: |
+          python main.py
