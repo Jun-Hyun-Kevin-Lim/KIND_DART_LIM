@@ -1,10 +1,10 @@
 # ==========================================================
-# KIND 유상증자 + DART 보정 통합 (DART-first)
-# - KIND RSS -> Playwright 표 파싱 -> (정정 시) 정정사항 표의 정정후 우선
-# - DART list/piicDecsn로 핵심 숫자(신규발행주식수, 증자전주식수, 증자비율, 자금용도, 확발행금액) 보정
-# - DART document.xml로 (확정발행가, 기준주가, 할인율) 보정
-# - Google Sheets 업서트: 일반=접수번호(acptNo) / 정정=event_key로 기존 행 업데이트
-# - seen: SKIP_SEEN=true일 때만 스킵, 아니면 계속 업데이트(로그 ts 갱신)
+# KIND(메인) + DART(같은 보고서일 때만 우선 덮기) 통합
+# - 매번 실행할 때마다 업데이트(덮어쓰기) 가능: SKIP_SEEN=false 권장
+# - KIND로 1차 레코드 생성
+# - DART가 "같은 보고서"로 판정되면 핵심 8개 컬럼을 DART로 덮어씀
+#   핵심: 신규발행주식수, 증자전 주식수, 증자비율, 자금용도, 확정발행금액(억원),
+#        확정발행가(원), 기준주가, 할인(할증률)
 # ==========================================================
 
 import os
@@ -26,7 +26,6 @@ from gspread.utils import rowcol_to_a1
 from playwright.sync_api import sync_playwright
 import requests
 
-
 # ==========================================================
 # Config (ENV)
 # ==========================================================
@@ -43,6 +42,7 @@ HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 LIMIT = int(os.getenv("LIMIT", "30"))
 RUN_ONE_ACPTNO = os.getenv("RUN_ONE_ACPTNO", "").strip()
 
+# ✅ 핵심: 기본 false(=스킵 안 함, 매번 업데이트)
 SKIP_SEEN = os.getenv("SKIP_SEEN", "false").lower() == "true"
 
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
@@ -56,13 +56,15 @@ SEEN_SHEET_NAME = os.getenv("SEEN_SHEET_NAME", "seen")
 
 # DART
 DART_API_KEY = os.getenv("DART_API_KEY", "").strip()
-DART_LOOKBACK_DAYS = int(os.getenv("DART_LOOKBACK_DAYS", "14"))
+DART_LOOKBACK_DAYS = int(os.getenv("DART_LOOKBACK_DAYS", "30"))
 DART_TIMEOUT = int(os.getenv("DART_TIMEOUT", "20"))
+SAME_REPORT_MAX_DAYS = int(os.getenv("SAME_REPORT_MAX_DAYS", "5"))
 
 # Debug
 OUTDIR = Path(os.getenv("OUTDIR", "out"))
 DEBUGDIR = OUTDIR / "debug"
 
+# ✅ 네 기존 컬럼 그대로
 RIGHTS_COLUMNS = [
     "회사명", "상장시장", "최초 이사회결의일", "증자방식", "발행상품", "신규발행주식수",
     "확정발행가(원)", "기준주가", "확정발행금액(억원)", "할인(할증률)",
@@ -70,13 +72,11 @@ RIGHTS_COLUMNS = [
     "이사회결의일", "자금용도", "투자자", "링크", "접수번호"
 ]
 
-
 @dataclass
 class Target:
     acpt_no: str
     title: str
     link: str
-
 
 # ==========================================================
 # Utils
@@ -151,6 +151,7 @@ def match_keyword(title: str) -> bool:
     return bool(title) and any(k in title for k in KEYWORDS)
 
 def is_correction_title(title: str) -> bool:
+    """제목 '맨 앞'이 정정인 경우만"""
     return bool(title) and title.strip().startswith("정정")
 
 def make_event_key(company: str, first_board_date: str, method: str) -> str:
@@ -178,7 +179,6 @@ def _fmt_int(n: int) -> str:
 def _fmt_amt_uk(n_won: int) -> str:
     return f"{(n_won / 100_000_000):,.2f}"
 
-
 # ==========================================================
 # RSS → targets
 # ==========================================================
@@ -205,7 +205,6 @@ def parse_rss_targets() -> List[Target]:
     for t in targets:
         uniq.setdefault(t.acpt_no, t)
     return list(uniq.values())
-
 
 # ==========================================================
 # Playwright: popup html → dfs
@@ -317,7 +316,6 @@ def scrape_one(context, t: Target) -> Tuple[List[pd.DataFrame], str]:
         except Exception:
             pass
 
-
 # ==========================================================
 # Google Sheets
 # ==========================================================
@@ -329,14 +327,12 @@ def gs_open():
     gc = gspread.service_account_from_dict(creds)
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
 
-    # seen
     try:
         seen_ws = sh.worksheet(SEEN_SHEET_NAME)
     except gspread.WorksheetNotFound:
         seen_ws = sh.add_worksheet(title=SEEN_SHEET_NAME, rows=5000, cols=2)
         seen_ws.update("A1:B1", [["acptNo", "ts"]])
 
-    # rights
     try:
         rights_ws = sh.worksheet(RIGHTS_OUT_SHEET)
     except gspread.WorksheetNotFound:
@@ -432,9 +428,8 @@ def upsert_seen(seen_ws, seen_map: Dict[str, int], acpt_no: str):
         seen_ws.append_row([acpt_no, ts], value_input_option="RAW")
         seen_map[acpt_no] = len(seen_ws.get_all_values())
 
-
 # ==========================================================
-# Rights issue parser helpers (KIND)
+# KIND Parser helpers
 # ==========================================================
 def scan_label_value(dfs: List[pd.DataFrame], label_candidates: List[str]) -> str:
     cand = {_norm(x) for x in label_candidates}
@@ -612,9 +607,11 @@ def parse_rights_issue_record(
     rec["접수번호"] = acpt_no
     rec["링크"] = link
 
+    # 회사명/시장
     rec["회사명"] = scan_label_value_preferring_correction(dfs, ["회 사 명", "회사명", "회사 명"], corr_after) or company_from_title(title)
     rec["상장시장"] = scan_label_value_preferring_correction(dfs, ["상장시장", "시장구분", "시장 구분"], corr_after) or market_from_title(title)
 
+    # 결의일
     rec["이사회결의일"] = scan_label_value_preferring_correction(
         dfs,
         ["15. 이사회결의일(결정일)", "이사회결의일(결정일)", "이사회결의일", "결정일"],
@@ -624,8 +621,10 @@ def parse_rights_issue_record(
         dfs, ["최초 이사회결의일", "최초이사회결의일"], corr_after
     ) or rec["이사회결의일"]
 
+    # 증자방식
     rec["증자방식"] = scan_label_value_preferring_correction(dfs, ["5. 증자방식", "증자방식", "발행방법", "배정방식"], corr_after)
 
+    # 주식수
     issue_txt = scan_label_value_preferring_correction(
         dfs,
         ["1. 신주의 종류와 수", "신주의 종류와 수", "신주의종류와수", "신주의 종류 및 수", "신주의종류및수"],
@@ -648,6 +647,7 @@ def parse_rights_issue_record(
     if prev_shares:
         rec["증자전 주식수"] = f"{prev_shares:,}"
 
+    # 발행가/기준주가/할인율
     price_txt = scan_label_value_preferring_correction(
         dfs,
         ["6. 신주 발행가액", "신주 발행가액", "신주발행가액", "신주 발행가액(원)", "신주발행가액(원)"],
@@ -670,14 +670,16 @@ def parse_rights_issue_record(
         disc = find_row_best_float(dfs, ["기준주가에대한할인율또는할증율"]) or find_row_best_float(dfs, ["할인율또는할증율"])
     rec["할인(할증률)"] = f"{disc}" if disc is not None else disc_txt
 
+    # 일정
     rec["납입일"] = scan_label_value_preferring_correction(dfs, ["9. 납입일", "납입일"], corr_after)
     rec["신주의 배당기산일"] = scan_label_value_preferring_correction(dfs, ["10. 신주의 배당기산일", "신주의 배당기산일", "배당기산일"], corr_after)
     rec["신주의 상장 예정일"] = scan_label_value_preferring_correction(dfs, ["12. 신주의 상장 예정일", "신주의 상장 예정일", "상장예정일"], corr_after)
 
+    # 자금용도/투자자
     rec["자금용도"] = scan_label_value_preferring_correction(dfs, ["4. 자금조달의 목적", "자금조달의 목적", "자금용도"], corr_after) or build_fund_use_text(dfs)
     rec["투자자"] = extract_investors(dfs, corr_after=corr_after)
 
-    # KIND 계산(백업)
+    # 백업 계산
     sh = _to_int(rec["신규발행주식수"])
     pr = _to_int(rec["확정발행가(원)"])
     if sh and pr:
@@ -689,9 +691,8 @@ def parse_rights_issue_record(
 
     return rec
 
-
 # ==========================================================
-# DART: prefetch + match + apply (DART-first)
+# DART: cache + match + same-report check + apply (DART-first only when same report)
 # ==========================================================
 DART_CLS_MAP = {"Y": "유가증권", "K": "코스닥", "N": "코넥스", "E": "기타"}
 
@@ -701,6 +702,7 @@ def _dart_get_json(url: str, params: dict) -> dict:
     return r.json()
 
 def dart_prefetch_yusang(api_key: str, lookback_days: int):
+    """최근 N일 '유상증자결정' list + corp_code별 piicDecsn 캐시"""
     end = datetime.now()
     start = end - timedelta(days=lookback_days)
     bgn_de = start.strftime("%Y%m%d")
@@ -759,6 +761,7 @@ def dart_prefetch_yusang(api_key: str, lookback_days: int):
     return filings, piic_map
 
 def dart_match_for_kind(rec: dict, filings: List[dict]) -> Optional[dict]:
+    """회사명 + 날짜(근접)로 후보 1개 선택"""
     cname = _norm_company(rec.get("회사명", ""))
     if not cname:
         return None
@@ -787,25 +790,39 @@ def dart_match_for_kind(rec: dict, filings: List[dict]) -> Optional[dict]:
     cands.sort(key=lambda x: x.get("rcept_dt", ""), reverse=True)
     return cands[0]
 
+def is_same_report(kind_rec: dict, dart_filing: dict, max_days: int) -> bool:
+    """
+    ✅ "똑같은 보고서" 판정:
+    1) 보고서명(유상증자결정)
+    2) 회사명(정규화)
+    3) 날짜 근접(KIND 이사회결의일 vs DART 접수일)
+    """
+    report_nm = (dart_filing.get("report_nm") or "")
+    if "유상증자결정" not in report_nm:
+        return False
+
+    kc = _norm_company(kind_rec.get("회사명", ""))
+    dc = _norm_company(dart_filing.get("corp_name", ""))
+    if not kc or not dc:
+        return False
+
+    if not (kc == dc or kc in dc or dc in kc):
+        return False
+
+    kdt = _safe_dt_yyyymmdd(kind_rec.get("이사회결의일") or kind_rec.get("최초 이사회결의일") or "")
+    ddt = _safe_dt_yyyymmdd(dart_filing.get("rcept_dt") or "")
+    if kdt and ddt:
+        if abs((ddt - kdt).days) > max_days:
+            return False
+
+    return True
+
 def dart_extract_xml_details(api_key: str, rcept_no: str) -> Dict[str, str]:
+    """document.xml ZIP에서 확정발행가/기준주가/할인율 추출"""
     url = "https://opendart.fss.or.kr/api/document.xml"
     params = {"crtfc_key": api_key, "rcept_no": rcept_no}
 
-    out = {
-        "board_date": "",
-        "pay_date": "",
-        "div_date": "",
-        "list_date": "",
-        "issue_price": "",
-        "base_price": "",
-        "discount": "",
-    }
-
-    def fix_date(raw_date_str: str) -> str:
-        nums = re.findall(r"\d+", raw_date_str or "")
-        if len(nums) >= 3:
-            return f"{nums[0]}-{nums[1].zfill(2)}-{nums[2].zfill(2)}"
-        return raw_date_str.strip()
+    out = {"issue_price": "", "base_price": "", "discount": ""}
 
     try:
         res = requests.get(url, params=params, stream=True, timeout=DART_TIMEOUT)
@@ -847,45 +864,20 @@ def dart_extract_xml_details(api_key: str, rcept_no: str) -> Dict[str, str]:
                 out["discount"] = m.group(1).strip() + "%"
                 break
 
-        # 날짜들
-        m = re.search(r"이사회결의일[^\d]*(\d{4}[\-\.년\s]+\d{1,2}[\-\.월\s]+\d{1,2})", raw_text)
-        if m: out["board_date"] = fix_date(m.group(1))
-
-        m = re.search(r"납\s*입\s*일[^\d]*(\d{4}[\-\.년\s]+\d{1,2}[\-\.월\s]+\d{1,2})", raw_text)
-        if m: out["pay_date"] = fix_date(m.group(1))
-
-        m = re.search(r"배당기산일[^\d]*(\d{4}[\-\.년\s]+\d{1,2}[\-\.월\s]+\d{1,2})", raw_text)
-        if m: out["div_date"] = fix_date(m.group(1))
-
-        m = re.search(r"상장\s*예정일[^\d]*(\d{4}[\-\.년\s]+\d{1,2}[\-\.월\s]+\d{1,2})", raw_text)
-        if m: out["list_date"] = fix_date(m.group(1))
-
     except Exception:
         return out
 
     return out
 
-def _need_xml_for_core(rec: dict) -> bool:
-    def looks_num(x: str) -> bool:
-        v = _to_int(x)
-        return v is not None and v > 0
-    issue_ok = looks_num(rec.get("확정발행가(원)", ""))
-    base_ok = looks_num(rec.get("기준주가", ""))
-    disc = (rec.get("할인(할증률)", "") or "").strip()
-    disc_ok = bool(re.search(r"[\-\+]?\d+(\.\d+)?%?$", disc))
-    return (not issue_ok) or (not base_ok) or (not disc_ok)
-
-def apply_dart_core_fields(rec: dict, filing: dict, piic_row: Optional[dict], xml_data: Optional[dict]):
+def apply_dart_core_fields(rec: dict, dart_filing: dict, piic_row: Optional[dict], xml_data: Optional[dict]):
+    """
+    ✅ 같은 보고서로 판정된 경우에만 호출!
+    핵심 8개 컬럼 DART-first 덮어쓰기
+    """
     # 상장시장(DART 우선)
-    corp_cls = str(filing.get("corp_cls") or "").strip()
+    corp_cls = str(dart_filing.get("corp_cls") or "").strip()
     if corp_cls:
         rec["상장시장"] = DART_CLS_MAP.get(corp_cls, rec.get("상장시장", ""))
-
-    # 증자방식(DART 우선, 있으면)
-    if piic_row:
-        ic_mthn = str(piic_row.get("ic_mthn") or "").strip()
-        if ic_mthn:
-            rec["증자방식"] = ic_mthn
 
     def to0(x):
         try:
@@ -894,7 +886,7 @@ def apply_dart_core_fields(rec: dict, filing: dict, piic_row: Optional[dict], xm
         except:
             return 0
 
-    # 신규발행주식수 / 증자전주식수 / 증자비율 (piicDecsn)
+    # piicDecsn 기반: 신규발행주식수 / 증자전주식수 / 증자비율 / 자금용도 / 확발금(억원)
     if piic_row:
         new_shares = to0(piic_row.get("nstk_ostk_cnt")) + to0(piic_row.get("nstk_estk_cnt"))
         old_shares = to0(piic_row.get("bfic_tisstk_ostk")) + to0(piic_row.get("bfic_tisstk_estk"))
@@ -906,7 +898,7 @@ def apply_dart_core_fields(rec: dict, filing: dict, piic_row: Optional[dict], xm
         if new_shares > 0 and old_shares > 0:
             rec["증자비율"] = f"{(new_shares / old_shares * 100):.2f}%"
 
-        # 자금용도 / 확정발행금액(억원) = 6종 합 (piicDecsn)
+        # 자금용도/확발금(억원): 6종 합
         purpose_fields = [
             ("fdpp_fclt", "시설자금"),
             ("fdpp_bsninh", "영업양수자금"),
@@ -927,7 +919,7 @@ def apply_dart_core_fields(rec: dict, filing: dict, piic_row: Optional[dict], xm
             rec["자금용도"] = ", ".join(names)
             rec["확정발행금액(억원)"] = _fmt_amt_uk(total)
 
-    # 확정발행가/기준주가/할인율 (document.xml)
+    # document.xml 기반: 확정발행가/기준주가/할인율
     if xml_data:
         if xml_data.get("issue_price"):
             rec["확정발행가(원)"] = xml_data["issue_price"]
@@ -936,37 +928,25 @@ def apply_dart_core_fields(rec: dict, filing: dict, piic_row: Optional[dict], xm
         if xml_data.get("discount"):
             rec["할인(할증률)"] = xml_data["discount"]
 
-        # 일정은 KIND가 비었을 때만 보완
-        if (not rec.get("이사회결의일")) and xml_data.get("board_date"):
-            rec["이사회결의일"] = xml_data["board_date"]
-        if (not rec.get("납입일")) and xml_data.get("pay_date"):
-            rec["납입일"] = xml_data["pay_date"]
-        if (not rec.get("신주의 배당기산일")) and xml_data.get("div_date"):
-            rec["신주의 배당기산일"] = xml_data["div_date"]
-        if (not rec.get("신주의 상장 예정일")) and xml_data.get("list_date"):
-            rec["신주의 상장 예정일"] = xml_data["list_date"]
-
-
 # ==========================================================
 # Main
 # ==========================================================
 def run():
     _, rights_ws, seen_ws = gs_open()
 
-    # 인덱스 로드
+    # 시트 값 로드(인덱스)
     values = load_sheet_values(rights_ws, RIGHTS_COLUMNS)
     last_row_ref = [len(values)]
     rights_index = build_acpt_index_from_values(values, RIGHTS_COLUMNS, key_field="접수번호")
     event_index = build_event_index_from_values(values, RIGHTS_COLUMNS)
 
-    # seen map
+    # seen map (스킵/로그용)
     seen_map = load_seen_map(seen_ws)
     seen_set = set(seen_map.keys())
 
     # DART 캐시(런 시작 시 1회)
     dart_filings, dart_piic_map = [], {}
     xml_cache: Dict[str, Dict[str, str]] = {}
-
     if DART_API_KEY:
         dart_filings, dart_piic_map = dart_prefetch_yusang(DART_API_KEY, DART_LOOKBACK_DAYS)
     else:
@@ -977,6 +957,7 @@ def run():
         targets = [Target(acpt_no=RUN_ONE_ACPTNO, title=f"[MANUAL]{RUN_ONE_ACPTNO}", link="")]
     else:
         targets = parse_rss_targets()
+        # ✅ SKIP_SEEN=false면 여기서 필터링 안 함 → 매번 업데이트 가능
         if SKIP_SEEN:
             targets = [t for t in targets if t.acpt_no not in seen_set]
         targets = targets[:LIMIT] if LIMIT > 0 else targets
@@ -1006,17 +987,18 @@ def run():
                     if is_correction_title(t.title):
                         corr_after = extract_correction_after_map(dfs)
 
+                    # 1) KIND 메인 레코드 생성
                     rec = parse_rights_issue_record(dfs, t.title, t.acpt_no, kind_url, corr_after=corr_after)
 
-                    # ✅ DART 매칭 후 핵심 컬럼 DART-first
+                    # 2) DART가 있으면 같은 보고서인지 확인 후, 같으면 DART 우선 덮기
                     if dart_filings:
                         filing = dart_match_for_kind(rec, dart_filings)
-                        if filing:
+                        if filing and is_same_report(rec, filing, SAME_REPORT_MAX_DAYS):
                             rcept_no = str(filing.get("rcept_no") or "").strip()
                             piic_row = dart_piic_map.get(rcept_no)
 
                             xml_data = None
-                            if rcept_no and DART_API_KEY and _need_xml_for_core(rec):
+                            if rcept_no and DART_API_KEY:
                                 if rcept_no in xml_cache:
                                     xml_data = xml_cache[rcept_no]
                                 else:
@@ -1025,16 +1007,20 @@ def run():
 
                             apply_dart_core_fields(rec, filing, piic_row, xml_data)
 
-                            # 링크에 KIND + DART 함께 저장
+                            # 링크: KIND + DART 함께
                             if rcept_no:
                                 dart_link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
                                 rec["링크"] = f"{kind_url} | {dart_link}"
 
-                            print(f"[DART] match={rec.get('회사명')} rcept_no={rcept_no} piic={'Y' if piic_row else 'N'} xml={'Y' if xml_data else 'N'}")
+                            print(f"[DART-APPLIED] company={rec.get('회사명')} rcept_no={rcept_no} piic={'Y' if piic_row else 'N'}")
                         else:
-                            print(f"[DART] no-match company={rec.get('회사명')} board={rec.get('이사회결의일')}")
+                            # 같은 보고서로 확정 못 하면 KIND 유지
+                            if filing:
+                                print(f"[DART-SKIP] not-same-report company={rec.get('회사명')} rcept_dt={filing.get('rcept_dt')} board={rec.get('이사회결의일')}")
+                            else:
+                                print(f"[DART-SKIP] no-match company={rec.get('회사명')} board={rec.get('이사회결의일')}")
 
-                    # ✅ 정정 공시: event_key로 기존 행 찾아 UPDATE
+                    # 3) 시트 업데이트(정정이면 event_key로 기존행 찾아 덮어쓰기)
                     if is_correction_title(t.title):
                         evk = make_event_key(
                             rec.get("회사명", ""),
@@ -1075,7 +1061,7 @@ def run():
 
                         print(f"[OK] {t.acpt_no} correction=N mode={mode.upper()} row={row}")
 
-                # seen: 로그(ts) 갱신
+                # 4) seen은 스킵용이 아니라 “처리 로그(ts 갱신)” 용
                 upsert_seen(seen_ws, seen_map, t.acpt_no)
                 ok += 1
 
